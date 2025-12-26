@@ -31,13 +31,6 @@ import type {
   ResumedSessionData,
 } from '../services/chatRecordingService.js';
 import type { ContentGenerator } from './contentGenerator.js';
-import {
-  DEFAULT_GEMINI_FLASH_MODEL,
-  DEFAULT_GEMINI_MODEL,
-  DEFAULT_GEMINI_MODEL_AUTO,
-  DEFAULT_THINKING_MODE,
-  getEffectiveModel,
-} from '../config/models.js';
 import { LoopDetectionService } from '../services/loopDetectionService.js';
 import { ChatCompressionService } from '../services/chatCompressionService.js';
 import { ideContextStore } from '../ide/ideContext.js';
@@ -45,6 +38,10 @@ import {
   logContentRetryFailure,
   logNextSpeakerCheck,
 } from '../telemetry/loggers.js';
+import {
+  fireBeforeAgentHook,
+  fireAfterAgentHook,
+} from './clientHookTriggers.js';
 import {
   ContentRetryFailureEvent,
   NextSpeakerCheckEvent,
@@ -55,26 +52,17 @@ import { handleFallback } from '../fallback/handler.js';
 import type { RoutingContext } from '../routing/routingStrategy.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import type { ModelConfigKey } from '../services/modelConfigService.js';
-
-export function isThinkingSupported(model: string) {
-  return model.startsWith('gemini-2.5') || model === DEFAULT_GEMINI_MODEL_AUTO;
-}
-
-export function isThinkingDefault(model: string) {
-  if (model.startsWith('gemini-2.5-flash-lite')) {
-    return false;
-  }
-  return model.startsWith('gemini-2.5') || model === DEFAULT_GEMINI_MODEL_AUTO;
-}
+import { calculateRequestTokenCount } from '../utils/tokenCalculation.js';
+import {
+  applyModelSelection,
+  createAvailabilityContextProvider,
+} from '../availability/policyHelpers.js';
+import type { RetryAvailabilityContext } from '../utils/retry.js';
 
 const MAX_TURNS = 100;
 
 export class GeminiClient {
   private chat?: GeminiChat;
-  private readonly generateContentConfig: GenerateContentConfig = {
-    temperature: 0,
-    topP: 1,
-  };
   private sessionTurnCount = 0;
 
   private readonly loopDetector: LoopDetectionService;
@@ -186,6 +174,18 @@ export class GeminiClient {
     });
   }
 
+  async updateSystemInstruction(): Promise<void> {
+    if (!this.isInitialized()) {
+      return;
+    }
+
+    const systemMemory = this.config.isJitContextEnabled()
+      ? this.config.getGlobalMemory()
+      : this.config.getUserMemory();
+    const systemInstruction = getCoreSystemPrompt(this.config, systemMemory);
+    this.getChat().setSystemInstruction(systemInstruction);
+  }
+
   async startChat(
     extraHistory?: Content[],
     resumedSessionData?: ResumedSessionData,
@@ -200,26 +200,14 @@ export class GeminiClient {
     const history = await getInitialChatHistory(this.config, extraHistory);
 
     try {
-      const userMemory = this.config.getUserMemory();
-      const systemInstruction = getCoreSystemPrompt(this.config, userMemory);
-      const model = this.config.getModel();
-
-      const config: GenerateContentConfig = { ...this.generateContentConfig };
-
-      if (isThinkingSupported(model)) {
-        config.thinkingConfig = {
-          includeThoughts: true,
-          thinkingBudget: DEFAULT_THINKING_MODE,
-        };
-      }
-
+      const systemMemory = this.config.isJitContextEnabled()
+        ? this.config.getGlobalMemory()
+        : this.config.getUserMemory();
+      const systemInstruction = getCoreSystemPrompt(this.config, systemMemory);
       return new GeminiChat(
         this.config,
-        {
-          systemInstruction,
-          ...config,
-          tools,
-        },
+        systemInstruction,
+        tools,
         history,
         resumedSessionData,
       );
@@ -402,17 +390,14 @@ export class GeminiClient {
     }
   }
 
-  private _getEffectiveModelForCurrentTurn(): string {
+  private _getActiveModelForCurrentTurn(): string {
     if (this.currentSequenceModel) {
       return this.currentSequenceModel;
     }
 
-    const configModel = this.config.getModel();
-    const model: string =
-      configModel === DEFAULT_GEMINI_MODEL_AUTO
-        ? DEFAULT_GEMINI_MODEL
-        : configModel;
-    return getEffectiveModel(this.config.isInFallbackMode(), model);
+    // Availability logic: The configured model is the source of truth,
+    // including any permanent fallbacks (config.setModel) or manual overrides.
+    return this.config.getActiveModel();
   }
 
   async *sendMessageStream(
@@ -422,6 +407,39 @@ export class GeminiClient {
     turns: number = MAX_TURNS,
     isInvalidStreamRetry: boolean = false,
   ): AsyncGenerator<ServerGeminiStreamEvent, Turn> {
+    if (!isInvalidStreamRetry) {
+      this.config.resetTurn();
+    }
+
+    // Fire BeforeAgent hook through MessageBus (only if hooks are enabled)
+    const hooksEnabled = this.config.getEnableHooks();
+    const messageBus = this.config.getMessageBus();
+    if (hooksEnabled && messageBus) {
+      const hookOutput = await fireBeforeAgentHook(messageBus, request);
+
+      if (
+        hookOutput?.isBlockingDecision() ||
+        hookOutput?.shouldStopExecution()
+      ) {
+        yield {
+          type: GeminiEventType.Error,
+          value: {
+            error: new Error(
+              `BeforeAgent hook blocked processing: ${hookOutput.getEffectiveReason()}`,
+            ),
+          },
+        };
+        return new Turn(this.getChat(), prompt_id);
+      }
+
+      // Add additional context from hooks to the request
+      const additionalContext = hookOutput?.getAdditionalContext();
+      if (additionalContext) {
+        const requestArray = Array.isArray(request) ? request : [request];
+        request = [...requestArray, { text: additionalContext }];
+      }
+    }
+
     if (this.lastPromptId !== prompt_id) {
       this.loopDetector.reset(prompt_id);
       this.lastPromptId = prompt_id;
@@ -442,10 +460,14 @@ export class GeminiClient {
     }
 
     // Check for context window overflow
-    const modelForLimitCheck = this._getEffectiveModelForCurrentTurn();
+    const modelForLimitCheck = this._getActiveModelForCurrentTurn();
 
-    const estimatedRequestTokenCount = Math.floor(
-      JSON.stringify(request).length / 4,
+    // Estimate tokens. For text-only requests, we estimate based on character length.
+    // For requests with non-text parts (like images, tools), we use the countTokens API.
+    const estimatedRequestTokenCount = await calculateRequestTokenCount(
+      request,
+      this.getContentGeneratorOrFail(),
+      modelForLimitCheck,
     );
 
     const remainingTokenCount =
@@ -515,14 +537,24 @@ export class GeminiClient {
     if (this.currentSequenceModel) {
       modelToUse = this.currentSequenceModel;
     } else {
-      const router = await this.config.getModelRouterService();
+      const router = this.config.getModelRouterService();
       const decision = await router.route(routingContext);
       modelToUse = decision.model;
-      // Lock the model for the rest of the sequence
-      this.currentSequenceModel = modelToUse;
     }
 
-    const resultStream = turn.run(modelToUse, request, linkedSignal);
+    // availability logic
+    const modelConfigKey: ModelConfigKey = { model: modelToUse };
+    const { model: finalModel } = applyModelSelection(
+      this.config,
+      modelConfigKey,
+      { consumeAttempt: false },
+    );
+    modelToUse = finalModel;
+
+    this.currentSequenceModel = modelToUse;
+    yield { type: GeminiEventType.ModelInfo, value: modelToUse };
+
+    const resultStream = turn.run(modelConfigKey, request, linkedSignal);
     for await (const event of resultStream) {
       if (this.loopDetector.addAndCheck(event)) {
         yield { type: GeminiEventType.LoopDetected };
@@ -588,9 +620,9 @@ export class GeminiClient {
       );
       if (nextSpeakerCheck?.next_speaker === 'model') {
         const nextRequest = [{ text: 'Please continue.' }];
-        // This recursive call's events will be yielded out, but the final
-        // turn object will be from the top-level call.
-        yield* this.sendMessageStream(
+        // This recursive call's events will be yielded out, and the final
+        // turn object from the recursive call will be returned.
+        return yield* this.sendMessageStream(
           nextRequest,
           signal,
           prompt_id,
@@ -599,6 +631,32 @@ export class GeminiClient {
         );
       }
     }
+
+    // Fire AfterAgent hook through MessageBus (only if hooks are enabled)
+    if (hooksEnabled && messageBus) {
+      const responseText = turn.getResponseText() || '[no response text]';
+      const hookOutput = await fireAfterAgentHook(
+        messageBus,
+        request,
+        responseText,
+      );
+
+      // For AfterAgent hooks, blocking/stop execution should force continuation
+      if (
+        hookOutput?.isBlockingDecision() ||
+        hookOutput?.shouldStopExecution()
+      ) {
+        const continueReason = hookOutput.getEffectiveReason();
+        const continueRequest = [{ text: continueReason }];
+        yield* this.sendMessageStream(
+          continueRequest,
+          signal,
+          prompt_id,
+          boundedTurns - 1,
+        );
+      }
+    }
+
     return turn;
   }
 
@@ -613,23 +671,40 @@ export class GeminiClient {
       model: currentAttemptModel,
       generateContentConfig: currentAttemptGenerateContentConfig,
     } = desiredModelConfig;
-    const fallbackModelConfig =
-      this.config.modelConfigService.getResolvedConfig({
-        ...modelConfigKey,
-        model: DEFAULT_GEMINI_FLASH_MODEL,
-      });
 
     try {
       const userMemory = this.config.getUserMemory();
       const systemInstruction = getCoreSystemPrompt(this.config, userMemory);
+      const {
+        model,
+        config: newConfig,
+        maxAttempts: availabilityMaxAttempts,
+      } = applyModelSelection(this.config, modelConfigKey);
+      currentAttemptModel = model;
+      if (newConfig) {
+        currentAttemptGenerateContentConfig = newConfig;
+      }
+
+      // Define callback to refresh context based on currentAttemptModel which might be updated by fallback handler
+      const getAvailabilityContext: () => RetryAvailabilityContext | undefined =
+        createAvailabilityContextProvider(
+          this.config,
+          () => currentAttemptModel,
+        );
 
       const apiCall = () => {
-        const modelConfigToUse = this.config.isInFallbackMode()
-          ? fallbackModelConfig
-          : desiredModelConfig;
-        currentAttemptModel = modelConfigToUse.model;
-        currentAttemptGenerateContentConfig =
-          modelConfigToUse.generateContentConfig;
+        // AvailabilityService
+        const active = this.config.getActiveModel();
+        if (active !== currentAttemptModel) {
+          currentAttemptModel = active;
+          // Re-resolve config if model changed
+          const newConfig = this.config.modelConfigService.getResolvedConfig({
+            ...modelConfigKey,
+            model: currentAttemptModel,
+          });
+          currentAttemptGenerateContentConfig = newConfig.generateContentConfig;
+        }
+
         const requestConfig: GenerateContentConfig = {
           ...currentAttemptGenerateContentConfig,
           abortSignal,
@@ -650,12 +725,15 @@ export class GeminiClient {
         error?: unknown,
       ) =>
         // Pass the captured model to the centralized handler.
-        await handleFallback(this.config, currentAttemptModel, authType, error);
+        handleFallback(this.config, currentAttemptModel, authType, error);
 
       const result = await retryWithBackoff(apiCall, {
         onPersistent429: onPersistent429Callback,
         authType: this.config.getContentGeneratorConfig()?.authType,
+        maxAttempts: availabilityMaxAttempts,
+        getAvailabilityContext,
       });
+
       return result;
     } catch (error: unknown) {
       if (abortSignal.aborted) {
@@ -684,7 +762,7 @@ export class GeminiClient {
     // If the model is 'auto', we will use a placeholder model to check.
     // Compression occurs before we choose a model, so calling `count_tokens`
     // before the model is chosen would result in an error.
-    const model = this._getEffectiveModelForCurrentTurn();
+    const model = this._getActiveModelForCurrentTurn();
 
     const { newHistory, info } = await this.compressionService.compress(
       this.getChat(),
@@ -699,7 +777,8 @@ export class GeminiClient {
       info.compressionStatus ===
       CompressionStatus.COMPRESSION_FAILED_INFLATED_TOKEN_COUNT
     ) {
-      this.hasFailedCompressionAttempt = !force && true;
+      this.hasFailedCompressionAttempt =
+        this.hasFailedCompressionAttempt || !force;
     } else if (info.compressionStatus === CompressionStatus.COMPRESSED) {
       if (newHistory) {
         this.chat = await this.startChat(newHistory);

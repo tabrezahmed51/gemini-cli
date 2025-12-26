@@ -14,6 +14,8 @@ import { useKeypress } from '../hooks/useKeypress.js';
 import * as process from 'node:process';
 import * as path from 'node:path';
 import { relaunchApp } from '../../utils/processUtils.js';
+import { runExitCleanup } from '../../utils/cleanup.js';
+import { ExitCodes } from '@google/gemini-cli-core';
 
 export enum FolderTrustChoice {
   TRUST_FOLDER = 'trust_folder',
@@ -39,6 +41,7 @@ export const FolderTrustDialog: React.FC<FolderTrustDialogProps> = ({
         }, 250);
       }
     };
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
     doRelaunch();
   }, [isRestarting]);
 
@@ -46,8 +49,9 @@ export const FolderTrustDialog: React.FC<FolderTrustDialogProps> = ({
     (key) => {
       if (key.name === 'escape') {
         setExiting(true);
-        setTimeout(() => {
-          process.exit(1);
+        setTimeout(async () => {
+          await runExitCleanup();
+          process.exit(ExitCodes.FATAL_CANCELLATION_ERROR);
         }, 100);
       }
     },
@@ -76,14 +80,14 @@ export const FolderTrustDialog: React.FC<FolderTrustDialogProps> = ({
   ];
 
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" width="100%">
       <Box
         flexDirection="column"
         borderStyle="round"
         borderColor={theme.status.warning}
         padding={1}
-        width="100%"
         marginLeft={1}
+        marginRight={1}
       >
         <Box flexDirection="column" marginBottom={1}>
           <Text bold color={theme.text.primary}>

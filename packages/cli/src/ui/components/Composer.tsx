@@ -99,6 +99,8 @@ export const Composer = () => {
             <Text color={theme.status.warning}>
               Press Ctrl+C again to exit.
             </Text>
+          ) : uiState.warningMessage ? (
+            <Text color={theme.status.warning}>{uiState.warningMessage}</Text>
           ) : uiState.ctrlDPressedOnce ? (
             <Text color={theme.status.warning}>
               Press Ctrl+D again to exit.
@@ -155,6 +157,7 @@ export const Composer = () => {
           suggestionsWidth={uiState.suggestionsWidth}
           onSubmit={uiActions.handleFinalSubmit}
           userMessages={uiState.userMessages}
+          setBannerVisible={uiActions.setBannerVisible}
           onClearScreen={uiActions.handleClearScreen}
           config={config}
           slashCommands={uiState.slashCommands || []}
@@ -170,7 +173,9 @@ export const Composer = () => {
           placeholder={
             vimEnabled
               ? "  Press 'i' for INSERT mode and 'Esc' for NORMAL mode."
-              : '  Type your message or @path/to/file'
+              : uiState.shellModeActive
+                ? '  Type your shell command'
+                : '  Type your message or @path/to/file'
           }
           setQueueErrorMessage={uiActions.setQueueErrorMessage}
           streamingState={uiState.streamingState}

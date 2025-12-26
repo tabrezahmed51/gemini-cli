@@ -7,7 +7,7 @@
 // Defines valid event metadata keys for Clearcut logging.
 export enum EventMetadataKey {
   // Deleted enums: 24
-  // Next ID: 122
+  // Next ID: 137
 
   GEMINI_CLI_KEY_UNKNOWN = 0,
 
@@ -190,6 +190,15 @@ export enum EventMetadataKey {
 
   // Logs active user settings
   GEMINI_CLI_USER_SETTINGS = 84,
+
+  // Logs the name of the GitHub Action workflow that triggered the session.
+  GEMINI_CLI_GH_WORKFLOW_NAME = 130,
+
+  // Logs the active experiment IDs for the session.
+  GEMINI_CLI_EXPERIMENT_IDS = 131,
+
+  // Logs the repository name of the GitHub Action that triggered the session.
+  GEMINI_CLI_GH_REPOSITORY_NAME_HASH = 132,
 
   // ==========================================================================
   // Loop Detected Event Keys
@@ -476,4 +485,36 @@ export enum EventMetadataKey {
 
   // Logs whether the session is interactive.
   GEMINI_CLI_INTERACTIVE = 125,
+
+  // ==========================================================================
+  // LLM Loop Check Event Keys
+  // ==========================================================================
+
+  // Logs the confidence score from the flash model loop check.
+  GEMINI_CLI_LLM_LOOP_CHECK_FLASH_CONFIDENCE = 126,
+
+  // Logs the name of the main model used for the secondary loop check.
+  GEMINI_CLI_LLM_LOOP_CHECK_MAIN_MODEL = 127,
+
+  // Logs the confidence score from the main model loop check.
+  GEMINI_CLI_LLM_LOOP_CHECK_MAIN_MODEL_CONFIDENCE = 128,
+
+  // Logs the model that confirmed the loop.
+  GEMINI_CLI_LOOP_DETECTED_CONFIRMED_BY_MODEL = 129,
+
+  // ==========================================================================
+  // Hook Call Event Keys
+  // ==========================================================================
+
+  // Logs the name of the hook event (e.g., 'BeforeTool', 'AfterModel').
+  GEMINI_CLI_HOOK_EVENT_NAME = 133,
+
+  // Logs the duration of the hook execution in milliseconds.
+  GEMINI_CLI_HOOK_DURATION_MS = 134,
+
+  // Logs whether the hook execution was successful.
+  GEMINI_CLI_HOOK_SUCCESS = 135,
+
+  // Logs the exit code of the hook script (if applicable).
+  GEMINI_CLI_HOOK_EXIT_CODE = 136,
 }

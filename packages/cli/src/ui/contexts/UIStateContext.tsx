@@ -32,11 +32,15 @@ import type { UpdateObject } from '../utils/updateCheck.js';
 export interface ProQuotaDialogRequest {
   failedModel: string;
   fallbackModel: string;
+  message: string;
+  isTerminalQuotaError: boolean;
+  isModelNotFoundError?: boolean;
   resolve: (intent: FallbackIntent) => void;
 }
 
 import { type UseHistoryManagerReturn } from '../hooks/useHistoryManager.js';
 import { type RestartReason } from '../hooks/useIdeTrustListener.js';
+import type { TerminalBackgroundColor } from '../utils/terminalCapabilityManager.js';
 
 export interface UIState {
   history: HistoryItem[];
@@ -56,8 +60,10 @@ export interface UIState {
   debugMessage: string;
   quittingMessages: HistoryItem[] | null;
   isSettingsDialogOpen: boolean;
+  isSessionBrowserOpen: boolean;
   isModelDialogOpen: boolean;
   isPermissionsDialogOpen: boolean;
+  permissionsDialogProps: { targetDirectory?: string } | null;
   slashCommands: readonly SlashCommand[] | undefined;
   pendingSlashCommandHistoryItems: HistoryItemWithoutId[];
   commandContext: CommandContext;
@@ -124,6 +130,14 @@ export interface UIState {
   showDebugProfiler: boolean;
   showFullTodos: boolean;
   copyModeEnabled: boolean;
+  warningMessage: string | null;
+  bannerData: {
+    defaultText: string;
+    warningText: string;
+  };
+  bannerVisible: boolean;
+  customDialog: React.ReactNode | null;
+  terminalBackgroundColor: TerminalBackgroundColor;
 }
 
 export const UIStateContext = createContext<UIState | null>(null);

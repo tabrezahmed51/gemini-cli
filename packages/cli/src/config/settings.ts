@@ -33,15 +33,26 @@ import { resolveEnvVarsInObject } from '../utils/envVarResolver.js';
 import { customDeepMerge, type MergeableObject } from '../utils/deepMerge.js';
 import { updateSettingsFilePreservingFormat } from '../utils/commentJson.js';
 import type { ExtensionManager } from './extension-manager.js';
+import {
+  validateSettings,
+  formatValidationError,
+} from './settings-validation.js';
+import { SettingPaths } from './settingPaths.js';
 
 function getMergeStrategyForPath(path: string[]): MergeStrategy | undefined {
   let current: SettingDefinition | undefined = undefined;
   let currentSchema: SettingsSchema | undefined = getSettingsSchema();
+  let parent: SettingDefinition | undefined = undefined;
 
   for (const key of path) {
     if (!currentSchema || !currentSchema[key]) {
+      // Key not found in schema - check if parent has additionalProperties
+      if (parent?.additionalProperties?.mergeStrategy) {
+        return parent.additionalProperties.mergeStrategy;
+      }
       return undefined;
     }
+    parent = current;
     current = currentSchema[key];
     currentSchema = current.properties;
   }
@@ -108,13 +119,14 @@ const MIGRATION_MAP: Record<string, string> = {
   memoryImportFormat: 'context.importFormat',
   memoryDiscoveryMaxDirs: 'context.discoveryMaxDirs',
   model: 'model.name',
-  preferredEditor: 'general.preferredEditor',
+  preferredEditor: SettingPaths.General.PreferredEditor,
   retryFetchErrors: 'general.retryFetchErrors',
   sandbox: 'tools.sandbox',
   selectedAuthType: 'security.auth.selectedType',
   enableInteractiveShell: 'tools.shell.enableInteractiveShell',
   shellPager: 'tools.shell.pager',
   shellShowColor: 'tools.shell.showColor',
+  shellInactivityTimeout: 'tools.shell.inactivityTimeout',
   skipNextSpeakerCheck: 'model.skipNextSpeakerCheck',
   summarizeToolOutput: 'model.summarizeToolOutput',
   telemetry: 'telemetry',
@@ -221,6 +233,7 @@ export interface SessionRetentionSettings {
 export interface SettingsError {
   message: string;
   path: string;
+  severity: 'error' | 'warning';
 }
 
 export interface SettingsFile {
@@ -262,7 +275,7 @@ export function needsMigration(settings: Record<string, unknown>): boolean {
     if (v1Key === v2Path || !(v1Key in settings)) {
       return false;
     }
-    // If a key exists that is both a V1 key and a V2 container (like 'model'),
+    // If a key exists that is a V1 key and a V2 container (like 'model'),
     // we need to check the type. If it's an object, it's a V2 container and not
     // a V1 key that needs migration.
     if (
@@ -290,6 +303,19 @@ function migrateSettingsToV2(
 
   for (const [oldKey, newPath] of Object.entries(MIGRATION_MAP)) {
     if (flatKeys.has(oldKey)) {
+      // If the key exists and is a V2 container (like 'model'), and the value is an object,
+      // it is likely already migrated or partially migrated. We should not move it
+      // to the mapped V2 path (e.g. 'model' -> 'model.name').
+      // Instead, let it fall through to the "Carry over" section to be merged.
+      if (
+        KNOWN_V2_CONTAINERS.has(oldKey) &&
+        typeof flatSettings[oldKey] === 'object' &&
+        flatSettings[oldKey] !== null &&
+        !Array.isArray(flatSettings[oldKey])
+      ) {
+        continue;
+      }
+
       setNestedProperty(v2Settings, newPath, flatSettings[oldKey]);
       flatKeys.delete(oldKey);
     }
@@ -319,8 +345,8 @@ function migrateSettingsToV2(
       v2Settings[remainingKey] = customDeepMerge(
         pathAwareGetStrategy,
         {},
-        newValue as MergeableObject,
         existingValue as MergeableObject,
+        newValue as MergeableObject,
       );
     } else {
       v2Settings[remainingKey] = newValue;
@@ -431,6 +457,7 @@ export class LoadedSettings {
     workspace: SettingsFile,
     isTrusted: boolean,
     migratedInMemoryScopes: Set<SettingScope>,
+    errors: SettingsError[] = [],
   ) {
     this.system = system;
     this.systemDefaults = systemDefaults;
@@ -438,6 +465,7 @@ export class LoadedSettings {
     this.workspace = workspace;
     this.isTrusted = isTrusted;
     this.migratedInMemoryScopes = migratedInMemoryScopes;
+    this.errors = errors;
     this._merged = this.computeMergedSettings();
   }
 
@@ -447,6 +475,7 @@ export class LoadedSettings {
   readonly workspace: SettingsFile;
   readonly isTrusted: boolean;
   readonly migratedInMemoryScopes: Set<SettingScope>;
+  readonly errors: SettingsError[];
 
   private _merged: Settings;
 
@@ -633,6 +662,7 @@ export function loadSettings(
           settingsErrors.push({
             message: 'Settings file is not a valid JSON object.',
             path: filePath,
+            severity: 'error',
           });
           return { settings: {} };
         }
@@ -662,12 +692,28 @@ export function loadSettings(
             settingsObject = migratedSettings;
           }
         }
+
+        // Validate settings structure with Zod after migration
+        const validationResult = validateSettings(settingsObject);
+        if (!validationResult.success && validationResult.error) {
+          const errorMessage = formatValidationError(
+            validationResult.error,
+            filePath,
+          );
+          settingsErrors.push({
+            message: errorMessage,
+            path: filePath,
+            severity: 'warning',
+          });
+        }
+
         return { settings: settingsObject as Settings, rawJson: content };
       }
     } catch (error: unknown) {
       settingsErrors.push({
         message: getErrorMessage(error),
         path: filePath,
+        severity: 'error',
       });
     }
     return { settings: {} };
@@ -739,10 +785,10 @@ export function loadSettings(
   // the settings to avoid a cycle
   loadEnvironment(tempMergedSettings);
 
-  // Create LoadedSettings first
-
-  if (settingsErrors.length > 0) {
-    const errorMessages = settingsErrors.map(
+  // Check for any fatal errors before proceeding
+  const fatalErrors = settingsErrors.filter((e) => e.severity === 'error');
+  if (fatalErrors.length > 0) {
+    const errorMessages = fatalErrors.map(
       (error) => `Error in ${error.path}: ${error.message}`,
     );
     throw new FatalConfigError(
@@ -777,6 +823,7 @@ export function loadSettings(
     },
     isTrusted,
     migratedInMemoryScopes,
+    settingsErrors,
   );
 }
 
@@ -791,6 +838,7 @@ export function migrateDeprecatedSettings(
         `Migrating deprecated extensions.disabled settings from ${scope} settings...`,
       );
       for (const extension of settings.extensions.disabled ?? []) {
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
         extensionManager.disableExtension(extension, scope);
       }
 
@@ -829,6 +877,21 @@ export function saveSettings(settingsFile: SettingsFile): void {
     coreEvents.emitFeedback(
       'error',
       'There was an error saving your latest settings changes.',
+      error,
+    );
+  }
+}
+
+export function saveModelChange(
+  loadedSettings: LoadedSettings,
+  model: string,
+): void {
+  try {
+    loadedSettings.setValue(SettingScope.User, 'model.name', model);
+  } catch (error) {
+    coreEvents.emitFeedback(
+      'error',
+      'There was an error saving your preferred model.',
       error,
     );
   }
